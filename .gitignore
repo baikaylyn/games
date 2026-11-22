@@ -1,0 +1,13 @@
+.DS_Store
+mods备份/
+存档备份/
+_构建源码/
+*.pak
+*.ucas
+*.utoc
+*.sav
+*.dmg
+*.app/
+__pycache__/
+*.pyc
+*.log

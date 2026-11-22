@@ -1,0 +1,259 @@
+// dmc4_input —— 鬼泣4 鼠标化操作重映射器（只在游戏窗口位于最前时生效）
+//
+//   ./dmc4_input [--sens N] [--melee i|j] [--no-camera] [--debug]
+//
+// 最终映射：
+//   鼠标左键         → 近战攻击（维吉尔/但丁 J，尼禄 I）
+//   鼠标右键         → 鬼手 / 风格技（L）
+//   鼠标中键         → 枪械攻击（近战键的另一个：维吉尔 I，尼禄 J）
+//   键盘 F           → 枪械攻击（和鼠标中键等价，左手好按）
+//   键盘 左/右 Shift → 锁定（按住生效）
+//   键盘 空格        → 跳跃 + 确认（两者本来就是同一个键）
+//   鼠标移动         → 转视角（↑↓←→，光标冻结做无限转角）
+//
+// 设计依据（Capcom 官方 PC 手册）：
+//   * 近战/枪械在两组角色上是相反的：尼禄 I 刀 J 枪，但丁/维吉尔 J 刀 I 枪。
+//     所以「枪械键」不硬编码，取近战键的另一个，--melee 换角色时自动跟着换。
+//   * 手册明确「Examine / Confirm / Cancel 固定绑在 A、B 两键，不可更改」，
+//     而 A 键同时是「跳跃 + 确认」→ 空格映射成 A 键后，确认与跳跃天然合一。
+//   * 游戏不支持鼠标转视角，也没有可选键位能绑到鼠标，只能系统层重映射。
+//
+// 四个必须遵守的技术细节（血泪）：
+//   1. 合成按键绝不能写 kCGEventSourceUserData：赋任何非零值都会被系统当无效事件丢弃。
+//   2. 点按必须 ≥ 1 帧（游戏 16~25fps），这里用 120ms 最小按住时长。
+//   3. 不能在事件拦截回调里 usleep：回调阻塞会把自己发的事件挤到一起送达。
+//      回调只置标志位，发送放到 CFRunLoopTimer 里。
+//   4. 自己合成的事件会带本进程 PID（kCGEventSourceUnixProcessID），据此跳过二次改写，
+//      否则「Shift→空格」会被「空格→K」吃掉，锁定变成跳跃。
+#include <ApplicationServices/ApplicationServices.h>
+#include <stdio.h>
+#include <stdlib.h>
+#include <string.h>
+#include <unistd.h>
+#include <sys/time.h>
+
+#define KC_I 34
+#define KC_J 38
+#define KC_L 37
+#define KC_K 40
+#define KC_SPACE 49
+#define KC_F 3
+#define KC_LSHIFT 56
+#define KC_RSHIFT 60
+#define KC_LEFT 123
+#define KC_RIGHT 124
+#define KC_DOWN 125
+#define KC_UP 126
+
+static int sens = 6;
+static int use_camera = 1;
+static int dbg = 0;
+static CGKeyCode melee_key = KC_J;   // 维吉尔/但丁；尼禄用 --melee i
+static CGKeyCode gun_key = KC_I;     // 近战键的另一个
+static CGKeyCode buster_key = KC_L;
+
+static int camL, camR, camU, camD;
+static int lock_held = 0;
+
+typedef struct { CGKeyCode k; double until; int on; } Pend;
+static Pend pend[8];
+static volatile int q_melee = 0, q_gun = 0, q_buster = 0;
+static volatile int q_lock = 0;      // 1=按下空格 2=松开空格
+
+static double now_s(void) {
+    struct timeval tv; gettimeofday(&tv, NULL);
+    return tv.tv_sec + tv.tv_usec / 1e6;
+}
+
+static void post_key(CGKeyCode c, bool down) {
+    CGEventRef e = CGEventCreateKeyboardEvent(NULL, c, down);
+    // 不要写 kCGEventSourceUserData（见文件头第 1 条）
+    CGEventPost(kCGHIDEventTap, e);
+    CFRelease(e);
+}
+
+static void press_min(CGKeyCode c, double minhold) {
+    post_key(c, true);
+    for (int i = 0; i < 8; i++) {
+        if (!pend[i].on) { pend[i].on = 1; pend[i].k = c; pend[i].until = now_s() + minhold; return; }
+    }
+    post_key(c, false);
+}
+
+static void tick_cb(CFRunLoopTimerRef t, void *info) {
+    // 所有发送都在拦截回调之外执行
+    if (q_melee)  { q_melee = 0;  press_min(melee_key, 0.12); }
+    if (q_gun)    { q_gun = 0;    press_min(gun_key, 0.12); }
+    if (q_buster) { q_buster = 0; press_min(buster_key, 0.12); }
+    int q = q_lock;
+    if (q) { q_lock = 0; post_key(KC_SPACE, q == 1); }
+
+    double n = now_s();
+    for (int i = 0; i < 8; i++) {
+        if (pend[i].on && n >= pend[i].until) { pend[i].on = 0; post_key(pend[i].k, false); }
+    }
+}
+
+static void release_cam(void) {
+    if (camL) { post_key(KC_LEFT, false); camL = 0; }
+    if (camR) { post_key(KC_RIGHT, false); camR = 0; }
+    if (camU) { post_key(KC_UP, false); camU = 0; }
+    if (camD) { post_key(KC_DOWN, false); camD = 0; }
+}
+
+static int is_game_owner(const char *s) {
+    return s && (strstr(s, "DevilMayCry") || strstr(s, "DEVIL MAY CRY"));
+}
+
+static int game_frontmost(void) {
+    int hit = 0;
+    CFArrayRef list = CGWindowListCopyWindowInfo(
+        kCGWindowListOptionOnScreenOnly | kCGWindowListExcludeDesktopElements, kCGNullWindowID);
+    if (!list) return 0;
+    CFIndex n = CFArrayGetCount(list);
+    for (CFIndex i = 0; i < n; i++) {
+        CFDictionaryRef d = CFArrayGetValueAtIndex(list, i);
+        CFNumberRef lr = CFDictionaryGetValue(d, kCGWindowLayer);
+        int layer = -1;
+        if (lr) CFNumberGetValue(lr, kCFNumberIntType, &layer);
+        if (layer != 0) continue;
+        CFStringRef owner = CFDictionaryGetValue(d, kCGWindowOwnerName);
+        char buf[256] = {0};
+        if (owner) CFStringGetCString(owner, buf, sizeof(buf), kCFStringEncodingUTF8);
+        hit = is_game_owner(buf);
+        break;
+    }
+    CFRelease(list);
+    return hit;
+}
+
+static CGEventRef cb(CGEventTapProxy proxy, CGEventType type, CGEventRef ev, void *ctx) {
+    if (type == kCGEventTapDisabledByTimeout || type == kCGEventTapDisabledByUserInput) {
+        CGEventTapEnable(ctx, true);
+        return ev;
+    }
+
+    // 自己合成的事件带本进程 PID → 直接放行
+    // （否则 Shift→空格 会被后面的「空格→K」改写，锁定就变成了跳跃）
+    if (CGEventGetIntegerValueField(ev, kCGEventSourceUnixProcessID) == (int64_t)getpid()) {
+        if (dbg) fprintf(stderr, "[放行自家事件] type=%d\n", type);
+        return ev;
+    }
+
+    if (!game_frontmost()) { release_cam(); lock_held = 0; return ev; }
+
+    // 长按 Cmd 放行（要正常用鼠标操作别的窗口时）
+    if (CGEventGetFlags(ev) & kCGEventFlagMaskCommand) { release_cam(); return ev; }
+
+    switch (type) {
+    case kCGEventKeyDown: {
+        CGKeyCode c = (CGKeyCode)CGEventGetIntegerValueField(ev, kCGKeyboardEventKeycode);
+        if (c == KC_SPACE) {
+            CGEventSetIntegerValueField(ev, kCGKeyboardEventKeycode, KC_K);  // 空格 = 跳跃 + 确认
+        } else if (c == KC_F) {
+            q_gun = 1;                                                        // F = 枪械
+        }
+        return ev;
+    }
+    case kCGEventKeyUp: {
+        CGKeyCode c = (CGKeyCode)CGEventGetIntegerValueField(ev, kCGKeyboardEventKeycode);
+        if (c == KC_SPACE) {
+            CGEventSetIntegerValueField(ev, kCGKeyboardEventKeycode, KC_K);
+        }
+        return ev;
+    }
+    case kCGEventFlagsChanged: {
+        // Shift 是修饰键，只产生 FlagsChanged，没有 KeyDown/KeyUp
+        CGKeyCode c = (CGKeyCode)CGEventGetIntegerValueField(ev, kCGKeyboardEventKeycode);
+        if (c == KC_LSHIFT || c == KC_RSHIFT) {
+            int down = (CGEventGetFlags(ev) & kCGEventFlagMaskShift) ? 1 : 0;
+            if (down != lock_held) {
+                lock_held = down;
+                q_lock = down ? 1 : 2;   // 合成空格 → 游戏里就是「锁定」
+            }
+        }
+        return ev;
+    }
+    case kCGEventLeftMouseDown:  q_melee = 1;  return NULL;
+    case kCGEventRightMouseDown: q_buster = 1; return NULL;
+    case kCGEventOtherMouseDown: q_gun = 1;    return NULL;   // 中键 = 枪械
+    case kCGEventLeftMouseUp:
+    case kCGEventRightMouseUp:
+    case kCGEventOtherMouseUp:   return NULL;
+    case kCGEventMouseMoved:
+    case kCGEventLeftMouseDragged:
+    case kCGEventRightMouseDragged:
+    case kCGEventOtherMouseDragged: {
+        if (!use_camera) return ev;
+        double dx = CGEventGetIntegerValueField(ev, kCGMouseEventDeltaX);
+        double dy = CGEventGetIntegerValueField(ev, kCGMouseEventDeltaY);
+        int wantL = dx < -sens, wantR = dx > sens;
+        int wantU = dy < -sens, wantD = dy > sens;
+        if (wantL != camL) { post_key(KC_LEFT, wantL); camL = wantL; }
+        if (wantR != camR) { post_key(KC_RIGHT, wantR); camR = wantR; }
+        if (wantU != camU) { post_key(KC_UP, wantU); camU = wantU; }
+        if (wantD != camD) { post_key(KC_DOWN, wantD); camD = wantD; }
+        return NULL;   // 吞掉移动 → 光标冻结，无限转角
+    }
+    default:
+        return ev;
+    }
+}
+
+int main(int argc, char **argv) {
+    int no_tap = 0;
+    for (int i = 1; i < argc; i++) {
+        if (!strcmp(argv[i], "--sens") && i + 1 < argc) sens = atoi(argv[++i]);
+        else if (!strcmp(argv[i], "--melee") && i + 1 < argc) {
+            melee_key = (argv[++i][0] == 'i' || argv[i][0] == 'I') ? KC_I : KC_J;
+        }
+        else if (!strcmp(argv[i], "--no-camera")) use_camera = 0;
+        else if (!strcmp(argv[i], "--debug")) dbg = 1;
+        else if (!strcmp(argv[i], "--no-tap")) no_tap = 1;
+        else if (!strcmp(argv[i], "--help")) {
+            printf("用法: dmc4_input [--sens N] [--melee i|j] [--no-camera] [--debug]\n");
+            return 0;
+        }
+    }
+    if (sens < 1) sens = 1;
+    gun_key = (melee_key == KC_J) ? KC_I : KC_J;   // 枪械 = 近战键的另一个
+
+    if (!CGPreflightPostEventAccess() || !CGPreflightListenEventAccess()) {
+        fprintf(stderr, "缺少权限：系统设置 → 隐私与安全性 → 辅助功能 / 输入监控\n");
+        return 1;
+    }
+
+    if (!no_tap) {
+        CFMachPortRef port = CGEventTapCreate(kCGSessionEventTap,
+            kCGHeadInsertEventTap, kCGEventTapOptionDefault,
+            CGEventMaskBit(kCGEventKeyDown) | CGEventMaskBit(kCGEventKeyUp) |
+            CGEventMaskBit(kCGEventFlagsChanged) |
+            CGEventMaskBit(kCGEventLeftMouseDown) | CGEventMaskBit(kCGEventLeftMouseUp) |
+            CGEventMaskBit(kCGEventRightMouseDown) | CGEventMaskBit(kCGEventRightMouseUp) |
+            CGEventMaskBit(kCGEventOtherMouseDown) | CGEventMaskBit(kCGEventOtherMouseUp) |
+            CGEventMaskBit(kCGEventMouseMoved) |
+            CGEventMaskBit(kCGEventLeftMouseDragged) |
+            CGEventMaskBit(kCGEventRightMouseDragged) |
+            CGEventMaskBit(kCGEventOtherMouseDragged),
+            cb, NULL);
+        if (!port) { fprintf(stderr, "事件拦截创建失败（权限不足？）\n"); return 1; }
+        CFRunLoopSourceRef src = CFMachPortCreateRunLoopSource(kCFAllocatorDefault, port, 0);
+        CFRunLoopAddSource(CFRunLoopGetCurrent(), src, kCFRunLoopCommonModes);
+        CGEventTapEnable(port, true);
+    }
+
+    CFRunLoopTimerRef timer = CFRunLoopTimerCreate(kCFAllocatorDefault,
+        CFAbsoluteTimeGetCurrent() + 0.01, 0.01, 0, 0, tick_cb, NULL);
+    CFRunLoopAddTimer(CFRunLoopGetCurrent(), timer, kCFRunLoopCommonModes);
+
+    printf("鬼泣4 鼠标重映射已启动（视角死区 %d px）\n", sens);
+    printf("  左键 → %c 近战      右键 → L 鬼手\n", melee_key == KC_I ? 'I' : 'J');
+    printf("  中键 / F → %c 枪械   Shift(按住) → 锁定\n", gun_key == KC_I ? 'I' : 'J');
+    printf("  空格 → 跳跃 + 确认   %s\n",
+           use_camera ? "鼠标移动 → 转视角" : "视角接管已关闭");
+    printf("  只在游戏窗口最前时生效；长按 Cmd 放行；Ctrl+C 退出\n");
+    fflush(stdout);
+
+    CFRunLoopRun();
+    return 0;
+}
