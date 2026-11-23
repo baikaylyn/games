@@ -37,7 +37,7 @@
 
 ## 注意事项
 
-- **`游戏构建/` 的结构不要手动改动**，否则下次同步会错位
+- **`游戏构建/` 的结构不要手动改动**，否则下次同步会错位；SSD 上的 `/Volumes/SSD/Game/游戏构建/` 是权威源，本机是镜像
 - 游戏本体在 SSD，不要复制回本地
 - 存档是唯一副本，操作前先备份；存档生效位置是 `~/Library/Application Support/MacNativeGames/HOGWARTS`，本目录只是备份
 - 虐杀原形的 Wine prefix 在 `~/Library/Application Support/MacNativeGames/PROTOTYPE`（405 M），**不要删**
