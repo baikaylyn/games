@@ -39,13 +39,16 @@
 
 - **`游戏构建/` 的结构不要手动改动**，否则下次同步会错位
 - 游戏本体在 SSD，不要复制回本地
-- 存档是唯一副本，操作前先备份
+- 存档是唯一副本，操作前先备份；存档生效位置是 `~/Library/Application Support/MacNativeGames/HOGWARTS`，本目录只是备份
+- 虐杀原形的 Wine prefix 在 `~/Library/Application Support/MacNativeGames/PROTOTYPE`（405 M），**不要删**
 - 不要执行游戏程序或改动 `mods备份` 内容
 
 ## 最近变更
 
+- 2026-11-23 回写总账：补存档生效位置与 Wine prefix 警示
 - 2026-11-22 建立本文件
 
-## 远程
+## GitHub 同步
 
-`git@github.com:baikaylyn/games.git`
+- 远程：`git@github.com:baikaylyn/games.git`（**公开**）
+- 最近同步：2026-11-23 首次推送 AGENTS.md；最新提交以 `git log -1` 为准
