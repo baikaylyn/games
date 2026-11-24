@@ -10,7 +10,7 @@
 set -u
 
 HERE="$(cd "$(dirname "$0")" && pwd)"
-DST="$HOME/游戏台/游戏构建"
+DST="$HOME/Games/游戏构建"
 mkdir -p "$DST"
 
 n=0
